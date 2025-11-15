@@ -1,6 +1,7 @@
 import time
 import pandas as pd
 import math
+import numpy as np
 
 class system:
     def __init__(self, F1, F2, L1, costperkw, weather=False):
@@ -316,24 +317,45 @@ class Pump:
     def __init__(self, is_small):
         self.frequency = 0.0
         self.on = False
-        self.flow = 0.0
+        self.flow = 0.0      # [m3/h]
         self.is_small = is_small
 
     def conv_to_flow(self, frequency):
-        if frequency <= 45:
+        """
+        Convert pump frequency [Hz] to flow [m3/h].
+
+        Original curve looks like it's in m3/s with a 0.001 factor.
+        Here we convert that to m3/h by multiplying by 3600.
+        """
+        if frequency <= 45.0:
             return 0.0
+
         if self.is_small:
-            return 0.001 * (36.46*frequency - 1322.9)
+            q_m3s = 0.001 * (36.46 * frequency - 1322.9)
         else:
-            return 0.001 * (63.81*frequency - 2208.61)
+            q_m3s = 0.001 * (63.81 * frequency - 2208.61)
+
+        # Clamp negative flows to zero
+        q_m3s = max(0.0, q_m3s)
+        # Convert to m3/h
+        return q_m3s * 3600.0
 
     def conv_to_freq(self, flow):
-        if flow <= 200.0:
+        """
+        Approximate inverse: flow [m3/h] -> frequency [Hz].
+        """
+        if flow <= 0.0:
             return 0.0
+
+        q_m3s = flow / 3600.0
+
         if self.is_small:
-            return (1322.9 + flow/0.001) / 36.46
+            freq = (q_m3s / 0.001 + 1322.9) / 36.46
         else:
-            return (2208.61 + flow/0.001) / 63.81
+            freq = (q_m3s / 0.001 + 2208.61) / 63.81
+
+        return max(0.0, freq)
+
 
 def system_from_row(row):
     """
@@ -403,16 +425,233 @@ def system_from_row(row):
 
     return sys
 
+def compute_baseline_cost(df, price_col="Electricity price 2: normal"):
+    """
+    Approximate baseline energy cost over the dataset, using raw F2.
 
-df = pd.read_csv("./output/cleaned_data.csv")
+    cost ≈ Σ price_t * F2_raw_t * Δt_hours
+    where F2_raw is 'Sum of pumped flow to WWTP F2'.
+    """
+    df = df.sort_values("Time stamp").reset_index(drop=True)
+    # dt per step in hours (assume regular sampling)
+    dt_seconds = df["Time stamp"].diff().dt.total_seconds().median()
+    dt_hours = dt_seconds / 3600.0
 
-row = df.iloc[100]          # pick any row
-sys = system_from_row(row)  # build a system from that snapshot
+    F2_raw = df["Sum of pumped flow to WWTP F2"].values  # m3/h
+    price = df[price_col].values
 
-print("L1:", sys.L1)
-print("F1:", sys.F1)
-print("F2:", sys.F2)
-print("Price:", sys.costperkw)
-for i, p in enumerate(sys.pumps):
-    print(i, "small" if p.is_small else "big",
-          "freq:", p.frequency, "flow:", p.flow, "on:", p.on)
+    baseline_cost = float(np.sum(price * F2_raw * dt_hours))
+    return baseline_cost
+
+def simulate_controller(df, price_col="Electricity price 2: normal"):
+    """
+    Run your `system` controller over the cleaned_data time series.
+
+    Uses:
+      - F1 from 'Inflow to tunnel F1'
+      - price from `price_col`
+      - L1 initial from 'Water level in tunnel L2'
+      - tank mass-balance using height_to_volume / volume_to_height
+    Returns:
+      results_df, total_controller_cost
+    """
+    df = df.sort_values("Time stamp").reset_index(drop=True)
+
+    # infer dt from data (assumes regular sampling, e.g. 15 min)
+    dt_seconds_series = df["Time stamp"].diff().dt.total_seconds()
+    dt_seconds = float(dt_seconds_series.median())
+    dt_hours = dt_seconds / 3600.0
+
+    # --- initialise system from first row ---
+    first_row = df.iloc[0]
+    sys = system_from_row(first_row)
+
+    # make sure L1 matches first_row and initialise volume via helper
+    L1_init = float(first_row["Water level in tunnel L2"])
+    V = height_to_volume(L1_init)
+    sys.L1 = L1_init
+
+    sys.F1 = float(first_row["Inflow to tunnel F1"])
+    sys.costperkw = float(first_row[price_col])
+    sys.weather = False  # we’ll infer a simple rain/dry flag below
+
+    controller_cost = 0.0
+    records = []
+
+    # simple threshold to detect "rain" from inflow
+    F1_rain_threshold = 2000.0  # adjust this based on your data
+
+    for t in range(1, len(df)):
+        row_prev = df.iloc[t - 1]
+        row = df.iloc[t]
+
+        # use actual dt if it varies; else use median dt
+        dt = dt_seconds
+        if pd.notna(row_prev["Time stamp"]) and pd.notna(row["Time stamp"]):
+            dt = (row["Time stamp"] - row_prev["Time stamp"]).total_seconds() or dt_seconds
+        dt_hours = dt / 3600.0
+
+        # --- update exogenous inputs for this interval (from prev row) ---
+        sys.F1 = float(row_prev["Inflow to tunnel F1"])
+        sys.costperkw = float(row_prev[price_col])
+
+        # crude "weather" from inflow
+        sys.weather = bool(sys.F1 > F1_rain_threshold)
+
+        # keep system's L1 consistent with our volume before stepping
+        sys.L1 = volume_to_height(V)
+
+        # --- run controller (high-level + low-level) ---
+        sys.step(dt)
+
+        # --- update physical state using volume model ---
+        # mass balance: V_{t+1} = V_t + dt * (F1 - F2)
+        V = V + dt_hours * (sys.F1 - sys.F2)
+        L1_new = volume_to_height(V)
+        sys.L1 = L1_new
+
+        # accumulate controller cost proxy (price * outflow)
+        controller_cost += sys.costperkw * sys.F2 * dt_hours
+
+        # record state for analysis
+        records.append({
+            "Time stamp": row["Time stamp"],
+            "F1": sys.F1,
+            "price": sys.costperkw,
+            "L1": sys.L1,
+            "L1_target": sys.L1p,
+            "F2_ctrl": sys.F2,
+            "F2_target": sys.F2_target,
+            "weather": sys.weather,
+        })
+
+    results_df = pd.DataFrame(records)
+    return results_df, controller_cost
+
+
+
+def evaluate_results(results_df, baseline_cost, controller_cost,
+                     L1_min=0.0, L1_max=8.0, flush_threshold=0.5,
+                     F1_low_threshold=500.0):
+    """
+    Print / return metrics:
+      - L1 violations
+      - daily flush success
+      - baseline vs controller cost
+    """
+    # --- 1. L1 safety ---
+    L1 = results_df["L1"].values
+    L1_violations_low = np.sum(L1 < L1_min)
+    L1_violations_high = np.sum(L1 > L1_max)
+
+    # --- 2. Flush requirement: per day, at least one timestep with
+    #       L1 <= flush_threshold AND F1 < F1_low_threshold and weather==False
+    results_df = results_df.copy()
+    results_df["date"] = pd.to_datetime(results_df["Time stamp"]).dt.date
+
+    flush_by_day = {}
+    for day, group in results_df.groupby("date"):
+        cond = (
+            (group["L1"] <= flush_threshold) &
+            (group["F1"] < F1_low_threshold) &
+            (~group["weather"])
+        )
+        flush_by_day[day] = bool(cond.any())
+
+    num_days = len(flush_by_day)
+    num_days_flushed = sum(flush_by_day.values())
+    num_days_missed = num_days - num_days_flushed
+
+    # --- 3. Cost comparison ---
+    cost_diff = baseline_cost - controller_cost
+    cost_diff_pct = 100.0 * cost_diff / baseline_cost if baseline_cost > 0 else np.nan
+
+    print("=== L1 safety ===")
+    print(f"  min(L1) = {L1.min():.3f}, max(L1) = {L1.max():.3f}")
+    print(f"  violations below {L1_min}: {L1_violations_low}")
+    print(f"  violations above {L1_max}: {L1_violations_high}")
+
+    print("\n=== Daily flush ===")
+    print(f"  days simulated: {num_days}")
+    print(f"  days with successful flush: {num_days_flushed}")
+    print(f"  days without flush: {num_days_missed}")
+
+    print("\n=== Cost comparison (proxy: price * flow) ===")
+    print(f"  baseline_cost   ≈ {baseline_cost:,.2f}")
+    print(f"  controller_cost ≈ {controller_cost:,.2f}")
+    print(f"  absolute saving ≈ {cost_diff:,.2f}")
+    print(f"  relative saving ≈ {cost_diff_pct:.2f}%")
+
+    return {
+        "L1_min": float(L1.min()),
+        "L1_max": float(L1.max()),
+        "L1_violations_low": int(L1_violations_low),
+        "L1_violations_high": int(L1_violations_high),
+        "days": int(num_days),
+        "days_flushed": int(num_days_flushed),
+        "days_missed": int(num_days_missed),
+        "baseline_cost": float(baseline_cost),
+        "controller_cost": float(controller_cost),
+        "cost_diff": float(cost_diff),
+        "cost_diff_pct": float(cost_diff_pct),
+    }
+
+
+convtable_raw = pd.read_excel(
+    "./raw_data/Volume of tunnel vs level Blominmäki.xlsx",
+    sheet_name="Taul1"
+)
+
+# keep only the first two columns: level, volume
+convtable_raw = convtable_raw.iloc[:, :2].copy()
+convtable_raw.columns = ["level", "volume"]
+
+# ensure sorted by level
+convtable_raw = convtable_raw.sort_values("level").reset_index(drop=True)
+
+# store as numpy arrays for fast interpolation
+_LEVELS = convtable_raw["level"].to_numpy()   # [m]
+_VOLUMES = convtable_raw["volume"].to_numpy() # [m3]
+
+
+# --- Helper: level -> volume ---
+
+def height_to_volume(level):
+    """
+    Convert water level in tunnel [m] to volume [m3] using linear interpolation
+    on the lookup table.
+
+    For levels outside the table range, clamps to min/max volume.
+    Works with scalars or numpy arrays.
+    """
+    return np.interp(level, _LEVELS, _VOLUMES)
+
+
+# --- Helper: volume -> level (inverse) ---
+
+def volume_to_height(volume):
+    """
+    Convert tunnel volume [m3] to water level [m] using linear interpolation
+    on the same lookup table.
+
+    For volumes outside the table range, clamps to min/max level.
+    Works with scalars or numpy arrays.
+    """
+    return np.interp(volume, _VOLUMES, _LEVELS)
+
+
+
+
+
+
+# 1. Load data with timestamp parsed
+df = pd.read_csv("./output/cleaned_data.csv", parse_dates=["Time stamp"])
+
+# 2. Compute baseline cost
+baseline_cost = compute_baseline_cost(df, price_col="Electricity price 2: normal")
+
+# 3. Simulate controller
+results_df, controller_cost = simulate_controller(df, price_col="Electricity price 2: normal")
+
+# 4. Evaluate
+metrics = evaluate_results(results_df, baseline_cost, controller_cost)
