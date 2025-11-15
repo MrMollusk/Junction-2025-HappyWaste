@@ -1,5 +1,6 @@
 import time
 import pandas as pd
+import math
 
 class system:
     def __init__(self, F1, F2, L1, costperkw, weather=False):
@@ -185,7 +186,125 @@ class system:
         # what actual F2 (self.F2) and L1 next become.
 
         # If you want, you can return F2_target for convenience:
-        return self.F2_target
+        
+        # if you don't already have dt_hours defined above in step(), uncomment:
+        # dt_hours = timestep / 3600.0
+
+        n = len(self.pumps)
+        full_freq = 50.0          # "full speed" frequency (Hz) – adjust if needed
+
+        min_switch_hours = 0.25   # HARD limit: 15 min between on/off
+        soft_switch_hours = 1.0   # SOFT preference: avoid switching more often than 1 h
+        max_switches_per_step = 2 # at most this many pumps can change state in one step
+
+        w_flow  = 1.0   # weight for matching F2_target
+        w_sw    = 0.1   # weight for number of switches
+        w_soft  = 1.0   # weight for switching too soon
+        w_wear  = 0.1   # weight for runtime imbalance
+
+        # --- 1. initialise per-pump timers and runtime if not present ---
+        for p in self.pumps:
+            if not hasattr(p, "time_since_on"):
+                p.time_since_on = 1e9 if p.on else 0.0
+            if not hasattr(p, "time_since_off"):
+                p.time_since_off = 1e9 if not p.on else 0.0
+            if not hasattr(p, "runtime"):
+                p.runtime = 0.0
+
+            if p.on:
+                p.time_since_on += dt_hours
+                p.time_since_off = 0.0
+                p.runtime += dt_hours
+            else:
+                p.time_since_off += dt_hours
+                p.time_since_on = 0.0
+
+        # --- 2. precompute flow at full speed for each pump ---
+        full_flows = []
+        for p in self.pumps:
+            full_flows.append(p.conv_to_flow(full_freq))
+
+        # --- 3. search over all ON/OFF patterns (except all-off) ---
+        best_score = math.inf
+        best_mask = None
+
+        for mask in range(1, 1 << n):  # 1..(2^n - 1), so at least one pump ON
+            num_switches = 0
+            soft_penalty = 0.0
+            valid = True
+
+            # 3a. enforce min switch time + switch count
+            for i in range(n):
+                new_on = bool((mask >> i) & 1)
+                p = self.pumps[i]
+
+                if new_on != p.on:
+                    num_switches += 1
+
+                    # HARD min on/off time
+                    if new_on and p.time_since_off < min_switch_hours:
+                        valid = False
+                        break
+                    if (not new_on) and p.time_since_on < min_switch_hours:
+                        valid = False
+                        break
+
+                    # SOFT penalty for switching too often
+                    if new_on and p.time_since_off < soft_switch_hours:
+                        soft_penalty += (soft_switch_hours - p.time_since_off)
+                    if (not new_on) and p.time_since_on < soft_switch_hours:
+                        soft_penalty += (soft_switch_hours - p.time_since_on)
+
+            if not valid or num_switches > max_switches_per_step:
+                continue
+
+            # 3b. compute candidate F2 and wear imbalance
+            F2_candidate = 0.0
+            runtimes_new = []
+            for i in range(n):
+                new_on = bool((mask >> i) & 1)
+                p = self.pumps[i]
+
+                if new_on:
+                    F2_candidate += full_flows[i]
+                    runtimes_new.append(p.runtime + dt_hours)
+                else:
+                    runtimes_new.append(p.runtime)
+
+            # respect global F2_max from high-level
+            if F2_candidate > self.F2_max:
+                continue
+
+            # runtime variance as a simple wear-imbalance metric
+            mean_rt = sum(runtimes_new) / n
+            var_rt = sum((rt - mean_rt) ** 2 for rt in runtimes_new) / n
+
+            # 3c. objective: match target flow, avoid switches, spread wear
+            flow_err = (F2_candidate - self.F2_target) ** 2
+
+            score = (
+                w_flow * flow_err
+                + w_sw * num_switches
+                + w_soft * soft_penalty
+                + w_wear * var_rt
+            )
+
+            if score < best_score:
+                best_score = score
+                best_mask = mask
+
+        # --- 4. apply best pattern (fallback: keep current pattern) ---
+        if best_mask is not None:
+            for i in range(n):
+                new_on = bool((best_mask >> i) & 1)
+                p = self.pumps[i]
+                p.on = new_on
+                p.frequency = full_freq if new_on else 0.0
+                p.flow = p.conv_to_flow(p.frequency)
+
+        # update actual total outflow from pumps
+        self.F2 = sum(p.flow for p in self.pumps)
+        
 
     def get_weather(self):
         # Placeholder for a real weather model or forecast.
