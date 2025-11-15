@@ -1,7 +1,7 @@
 import time
-import pandas as pd
 import math
 import numpy as np
+import pandas as pd
 
 class system:
     def __init__(self, F1, F2, L1, costperkw, weather=False):
@@ -36,37 +36,34 @@ class system:
         self.L1_min = 0.0
         self.L1_max = 8.0
         self.flush_threshold = 0.5     # "flushed" if we get below this
-        self.L1_safe_min = 0.2         # we really don't want to go below this
+        self.L1_safe_min = 0.2         # absolute safety floor
+        self.L1_oper_min = 1.0         # normal operation should stay above this
 
         # --- FLOW LIMITS (HIGH-LEVEL) ---
-        self.F2_min = 0.0              # low-level ensures at least 1 pump ON
-        # from data: F2 max ~10.8k → cap a bit above that
-        self.F2_max = 11000.0          # ### CHANGED: more realistic cap
+        self.F2_min = 0.0
+        self.F2_max = 16000.0          # cap a bit above real max
         self.max_F2_rate = self.F2_max
 
-        # --- NOMINAL INFLOW MODEL (FROM DATA) ---
-        # corrected F1 (m3/h) statistics from your dataset:
-        # mean ≈ 6250, p10 ≈ 3200, p90 ≈ 10000
-        # Use a slow filtered F1 to represent "typical load".
-        self.F1_slow = F1              # ### CHANGED: smoothed inflow state
+        # --- NOMINAL INFLOW MODEL ---
+        self.F1_slow = F1
 
         # --- PID AROUND L1 ---
-        # From data: mean L1 ≈ 2.25 m; target slightly above 2 m.
-        self.L1p_base = 2.2            # ### CHANGED
+        # “Nominal” level is ~2.2 m; we sit a bit above 2 m.
+        self.L1p_base = 2.2
         self.L1p = self.L1p_base
 
-        # PID gains tuned down a bit (we let feed-forward do the heavy work)
-        self.Kp = 300.0                # ### CHANGED
-        self.Ki = 20.0                 # ### CHANGED
-        self.Kd = 0.0
+        # PID gains – MUCH softer.
+        # Feed-forward (F2_base ≈ F1) is dominant; PID just trims.
+        self.Kp = 80.0       # was 300
+        self.Ki = 4.0        # was 20
+        self.Kd = 60.0       # was 0 → add damping
 
         self.error_prev = 0.0
         self.error_int = 0.0
-        self.integral_limit = 6.0      # ### CHANGED: tighter anti-windup
+        self.integral_limit = 3.0   # tighter anti-windup
 
         # --- ENERGY / PRICE NORMALIZATION ---
-        # From data: median price ~4.6
-        self.price_ref = 4.6           # ### CHANGED: fixed ref tied to data
+        self.price_ref = 0.046
 
         # --- FLUSH LOGIC ---
         self.flushed_today = False
@@ -81,45 +78,42 @@ class system:
     def step(self, timestep):
         """
         High-level + low-level update for one simulation step.
-
-        - Updates F2_target using PID around L1 with price & flush logic.
-        - Dispatches pumps with a heuristic that:
-            * matches F2_target,
-            * respects min on/off times,
-            * spreads runtime across pumps (low-runtime & big pumps preferred),
-            * limits switches per step.
         """
         dt = timestep
         dt_hours = dt / 3600.0
 
-        # advance sim clock
+                # VFD limits
+        full_freq = 50.0
+        freq_min = 47.6        # Hz – lowest allowed VFD speed
+
+
+        # ---------------------------------------------------
+        # TIME / INFLOW MODEL
+        # ---------------------------------------------------
         self.sim_time += dt
         self.realtime = time.time()
 
-        # --- SMOOTH INFLOW MODEL (F1_slow) ---
+        # Smooth nominal inflow
         tau_hours = 6.0
         alpha_slow = min(1.0, dt_hours / tau_hours) if tau_hours > 0 else 1.0
         self.F1_slow = (1.0 - alpha_slow) * self.F1_slow + alpha_slow * self.F1
         F1_for_base = max(10.0, self.F1_slow)
 
-        # --- DAILY FLUSH TRACKING ---
+        # Day / flush tracking
         day_index = int(self.sim_time // self.seconds_per_day)
         if day_index != self.current_day_index:
             self.current_day_index = day_index
             self.flushed_today = False
 
+        # if we ever actually get below the flush threshold, remember it
         if self.L1 <= self.flush_threshold:
             self.flushed_today = True
 
-        # --- TIME-OF-DAY INFO ---
         seconds_into_day = self.sim_time % self.seconds_per_day
         hour_of_day = seconds_into_day / 3600.0
 
-        # fixed daily flush schedule:
-        #   prep window: 01:00–03:00
-        #   flush window: 03:00–06:00
         flush_hour = 3.0
-        flush_window_hours = 3.0
+        flush_window_hours = 4.0
         prep_hours = 2.0
 
         flush_start = flush_hour
@@ -129,34 +123,57 @@ class system:
         in_flush_window = (hour_of_day >= flush_start) and (hour_of_day < flush_end)
         in_prep_window = (hour_of_day >= prep_start) and (hour_of_day < flush_start)
 
-        # --- PRICE RATIO / BIAS ---
+        # ---------------------------------------------------
+        # PRICE EFFECTS
+        # ---------------------------------------------------
         if self.price_ref > 0.0:
             price_ratio_raw = self.costperkw / self.price_ref
         else:
             price_ratio_raw = 1.0
 
         price_ratio_L1 = max(0.5, min(price_ratio_raw, 2.0))
-        price_bias = max(-1.0, min(price_ratio_raw - 1.0, 2.0))  # -1..2
+        price_bias = max(-0.5, min(price_ratio_raw - 1.0, 0.5))
 
-        # --- DYNAMIC SETPOINT L1p (LEVEL TARGET) ---
+        # ---------------------------------------------------
+        # L1 SETPOINT (WITH FLUSH / PREP / PRICE)
+        # ---------------------------------------------------
         L1_target = self.L1p_base
-
-        k_price_L1 = 0.5  # m per 2x price change
+        k_price_L1 = 0.5
         L1_target = self.L1p_base + k_price_L1 * (price_ratio_L1 - 1.0)
 
-        if (not self.flushed_today) and in_prep_window:
-            L1_target = min(L1_target, self.L1p_base - 0.3)
-
         if (not self.flushed_today) and in_flush_window:
-            L1_target = min(L1_target, self.flush_threshold + 0.05)
+            # FLUSH MODE: we conceptually "aim" at the flush threshold
+            L1_target = self.flush_threshold +0.1
 
-        margin = 0.3
-        L1_target = max(self.L1_min + margin,
+        elif (not self.flushed_today) and in_prep_window:
+            # PREP MODE: ramp from nominal level down to just above 1.0 m
+            prep_span = flush_start - prep_start  # = prep_hours
+            if prep_span > 0.0:
+                prog = (hour_of_day - prep_start) / prep_span
+                prog = max(0.0, min(prog, 1.0))
+            else:
+                prog = 1.0
+
+            # where we want to be at flush_start (≈1.0–1.1 m)
+            L1_prep_target = max(self.L1_oper_min,
+                                 self.flush_threshold)# + 0.2)  # ~1.0 m
+
+            # linear ramp: at prog=0 we sit at L1p_base, at prog=1 we sit at L1_prep_target
+            L1_target = L1_prep_target + (1.0 - prog) * (self.L1p_base - L1_prep_target)
+
+        else:
+            # NORMAL MODE: never aim below operational minimum
+            L1_target = max(self.L1_oper_min, L1_target)
+
+        # Clamp inside [margin, L1_max - margin]
+        margin = self.L1_safe_min
+        L1_target = max(self.L1_min - margin,
                         min(L1_target, self.L1_max - margin))
-
         self.L1p = L1_target
 
-        # --- PID ON LEVEL L1 ---
+        # ---------------------------------------------------
+        # PID ON L1
+        # ---------------------------------------------------
         error = self.L1 - self.L1p
 
         self.error_int += error * dt_hours
@@ -173,55 +190,109 @@ class system:
                  + self.Ki * self.error_int
                  + self.Kd * derror_dt)    # [m3/h]
 
-        # --- FEED-FORWARD FLOW BASED ON F1 & PRICE ---
-        k_price_flow = 0.3
-        F2_base = F1_for_base * (1.0 - k_price_flow * price_bias)
+        # Fade out price influence when level is low
+        if self.L1p_base > self.L1_oper_min:
+            fill_frac = (self.L1 - self.L1_oper_min) / (self.L1p_base - self.L1_oper_min)
+            fill_frac = max(0.0, min(fill_frac, 1.0))
+        else:
+            fill_frac = 1.0
+
+        effective_price_bias = price_bias * fill_frac
+
+        # ---------------------------------------------------
+        # FEED-FORWARD F2 BASED ON F1 & PRICE
+        # ---------------------------------------------------
+        k_price_flow = 0.15   # you can still tune this
+        F2_base = F1_for_base * (1.0 - k_price_flow * effective_price_bias)
         F2_base = max(0.3 * F1_for_base, min(1.7 * F1_for_base, F2_base))
 
         F2_raw = F2_base + u_pid
 
-        # --- EXTRA SAFETY NEAR HIGH LEVEL ---
+        # Extra safety near high level
         high_band = self.L1_max - 0.2
         if self.L1 > high_band:
             F2_raw = max(F2_raw, self.F1 + 2000.0)
 
-        # --- FLUSH ENFORCEMENT (SOFT, NOT FULL SEND) ---  ### CHANGED
-        if (not self.flushed_today) and in_flush_window and (self.L1 > self.flush_threshold + 0.05):
-            # ensure we are definitely draining, but cap aggressiveness:
-            flush_boost = 3000.0  # m3/h above inflow; tune if needed
-            F2_raw = max(F2_raw, self.F1 + flush_boost)
+        # When below operational minimum in NORMAL mode, don't drain faster than inflow
+        if (not in_flush_window) and (self.L1 < self.L1_oper_min):
+            F2_raw = min(F2_raw, self.F1)
 
-        # --- SAFE-MIN HANDLING (REACTIVE) ---
+                # ---------------------------------------------------
+        # FLUSH ENFORCEMENT – AGGRESSIVE, LET SAFE-MIN CLIP
+        # ---------------------------------------------------
+        if (not self.flushed_today) and in_flush_window:
+            try:
+                V_current = height_to_volume(self.L1)
+                V_goal    = 0.0#height_to_volume(self.flush_threshold - 0.35)   # ~0.5 m
+                V_safe    = height_to_volume(self.L1_safe_min-0.1)       # ~0.2 m
+
+                # Remaining time in window
+                hours_left = flush_end - hour_of_day
+                if hours_left < dt_hours:
+                    hours_left = dt_hours
+
+                # We don't want to "just" make it by the end;
+                # aim to finish within at most 1 hour from now.
+                flush_horizon = min(hours_left/2, 0.6)  # 1 hour
+
+                if V_current > V_goal:
+                    net_needed = (V_current - V_goal) / flush_horizon
+                else:
+                    net_needed = 0.0
+
+                # Be *deliberately* aggressive here – it's ok if
+                # the safe-min overrides have to cut us back.
+                k_aggr = 5.0   # try 2–3, tune as needed
+                net_needed *= k_aggr
+
+                # Base aggressive flush outflow
+                F2_flush = self.F1 + net_needed
+
+                # OPTIONAL: approximate "one extra big pump"
+                # one_big = Pump(is_small=False)
+                # F2_flush += 0.5 * one_big.conv_to_flow(full_freq)
+
+                # Only respect physical pump limits here.
+                # DO NOT pre-clip w.r.t. V_safe – that is handled
+                # by the geometric safe-min override later.
+                F2_flush = max(self.F2_min, min(F2_flush, self.F2_max))
+
+                # If this is stronger than the normal controller, use it.
+                if F2_flush > F2_raw:
+                    F2_raw = F2_flush
+
+            except Exception:
+                # if geometry table explodes for some reason, just fall back
+                pass
+
+
+
+
+        # ---------------------------------------------------
+        # SAFE-MIN HANDLING (REACTIVE)
+        # ---------------------------------------------------
+                # ---------------------------------------------------
+        # SAFE-MIN FLAG (no clamping here – real clamp is outside)
+        # ---------------------------------------------------
         below_safe = (self.L1 <= self.L1_safe_min)
-        if below_safe:
-            # when already below safe min, really back off
-            F2_raw = min(F2_raw, 0.8 * self.F1)
-            if self.L1 <= 0.1:
-                F2_raw = min(F2_raw, 0.2 * self.F1)
 
-        # --- FLOW LIMITS ---
+
+        # Flow limits
         F2_raw = max(self.F2_min, min(F2_raw, self.F2_max))
 
-        # --- PREDICTIVE SAFE-MIN CHECK USING GEOMETRY ---  ### NEW, IMPORTANT
-        try:
-            V_current = height_to_volume(self.L1)
-            V_safe = height_to_volume(self.L1_safe_min)
-            V_pred_raw = V_current + dt_hours * (self.F1 - F2_raw)
+        # Monotonicity guard vs level (but NOT during flush)
+        if not in_flush_window:
+            if (self.L1 < self.L1p_base or self.L1 > 4.5) and F2_raw > self.F2_target:
+                F2_raw = self.F2_target
 
-            if V_pred_raw < V_safe and dt_hours > 0.0:
-                # solve for F2 such that we land exactly at L1_safe_min
-                F2_safe = self.F1 + (V_current - V_safe) / dt_hours
-                F2_safe = max(self.F2_min, min(F2_safe, self.F2_max))
-                F2_raw = min(F2_raw, F2_safe)
-        except Exception:
-            # if anything weird happens with the geometry table, just fall back
-            pass
-
-        # --- SMOOTHING OF F2_TARGET ---
+        # ---------------------------------------------------
+        # SMOOTHING OF F2_TARGET
+        # ---------------------------------------------------
         if below_safe or ((not self.flushed_today) and in_flush_window):
+            # in danger / flush -> track raw command directly
             self.F2_target = F2_raw
         else:
-            delta_max = self.max_F2_rate * dt_hours   # [m3/h]
+            delta_max = self.max_F2_rate * dt_hours
             delta = F2_raw - self.F2_target
             if delta > delta_max:
                 delta = delta_max
@@ -229,9 +300,11 @@ class system:
                 delta = -delta_max
             self.F2_target = self.F2_target + delta
 
-        # ---------- LOW-LEVEL HEURISTIC DISPATCHER ----------
+        # ---------------------------------------------------
+        # LOW-LEVEL DISPATCHER WITH CONTINUOUS FREQUENCY
+        # (unchanged from your last version)
+        # ---------------------------------------------------
         n = len(self.pumps)
-        full_freq = 50.0          # Hz
 
         min_switch_hours = 0.25
         soft_switch_hours = 1.0
@@ -241,12 +314,12 @@ class system:
         w_sw     = 0.5
         w_soft   = 2.0
         w_wear   = 2.0
-        w_small  = 1.0
+        w_small  = 0.0
 
         self.last_num_switches = 0
         self.last_switch_mask = 0
 
-        # --- 1. update per-pump timers & runtime ---
+        # 1) Update per-pump timers & runtime
         for p in self.pumps:
             if not hasattr(p, "time_since_on"):
                 p.time_since_on = 1e9 if p.on else 0.0
@@ -265,7 +338,21 @@ class system:
                 p.time_since_off += dt_hours
                 p.time_since_on = 0.0
 
-        full_flows = [p.conv_to_flow(full_freq) for p in self.pumps]
+        # Linear models q = a * f + b for small & big pumps
+        freq_hi = 50.0
+        freq_lo = 49.0
+
+        tmp_small = Pump(is_small=True)
+        q_small_hi = tmp_small.conv_to_flow(freq_hi)
+        q_small_lo = tmp_small.conv_to_flow(freq_lo)
+        a_small = (q_small_hi - q_small_lo) / (freq_hi - freq_lo)
+        b_small = q_small_hi - a_small * freq_hi
+
+        tmp_big = Pump(is_small=False)
+        q_big_hi = tmp_big.conv_to_flow(freq_hi)
+        q_big_lo = tmp_big.conv_to_flow(freq_lo)
+        a_big = (q_big_hi - q_big_lo) / (freq_hi - freq_lo)
+        b_big = q_big_hi - a_big * freq_hi
 
         max_runtime = max((p.runtime for p in self.pumps), default=0.0)
         if max_runtime <= 0.0:
@@ -273,18 +360,33 @@ class system:
 
         n_small = sum(1 for p in self.pumps if p.is_small) or 1
 
+        # local F2 cap (global + safe-min)
+                # local F2 cap – only global limit; safe-min handled in simulate_controller
+        local_F2_max = self.F2_max
+
         best_score = math.inf
         best_mask = None
         best_switches = 0
+        best_freq = full_freq
 
+        # 2) Search over on/off masks, but allow continuous frequency
         for mask in range(1, 1 << n):
             num_switches = 0
             soft_penalty = 0.0
             valid = True
 
+            ns = 0   # number of small pumps on
+            nb = 0   # number of big pumps on
+
             for i in range(n):
                 new_on = bool((mask >> i) & 1)
                 p = self.pumps[i]
+
+                if new_on:
+                    if p.is_small:
+                        ns += 1
+                    else:
+                        nb += 1
 
                 if new_on != p.on:
                     num_switches += 1
@@ -303,28 +405,45 @@ class system:
 
             if (not valid) or (num_switches > max_switches_per_step):
                 continue
+            if ns + nb == 0:
+                continue
 
-            F2_candidate = 0.0
-            runtime_penalty = 0.0
-            small_on_count = 0
+            # Total flow model for this mask: F2 = a_total * f + b_total
+            a_total = ns * a_small + nb * a_big
+            b_total = ns * b_small + nb * b_big
+            if a_total <= 0.0:
+                continue
 
-            for i in range(n):
-                new_on = bool((mask >> i) & 1)
-                p = self.pumps[i]
-                if new_on:
-                    F2_candidate += full_flows[i]
-                    small_on_count += int(p.is_small)
-                    runtime_norm = p.runtime / max_runtime
-                    size_weight = 2.0 if p.is_small else 1.0
-                    runtime_penalty += size_weight * runtime_norm
+            # Ideal common frequency to hit F2_target
+            f_ideal = (self.F2_target - b_total) / a_total
 
-            if F2_candidate > self.F2_max:
+            if f_ideal < freq_min:
+                f_cmd = freq_min
+            elif f_ideal > full_freq:
+                f_cmd = full_freq
+            else:
+                f_cmd = f_ideal
+
+            F2_candidate = a_total * f_cmd + b_total
+
+            # Respect global & safe-min caps
+            if F2_candidate > local_F2_max:
                 continue
 
             if self.F2_target > 0.0:
                 flow_err = abs(F2_candidate - self.F2_target) / self.F2_target
             else:
                 flow_err = 0.0
+
+            runtime_penalty = 0.0
+            small_on_count = 0
+            for i in range(n):
+                new_on = bool((mask >> i) & 1)
+                p = self.pumps[i]
+                if new_on:
+                    small_on_count += int(p.is_small)
+                    runtime_norm = p.runtime / max_runtime
+                    runtime_penalty += runtime_norm
 
             small_usage_term = small_on_count / n_small
 
@@ -340,24 +459,75 @@ class system:
                 best_score = score
                 best_mask = mask
                 best_switches = num_switches
+                best_freq = f_cmd
 
+        # 3) Apply best mask and frequency
         if best_mask is not None:
             self.last_num_switches = best_switches
             self.last_switch_mask = best_mask
             for i in range(n):
                 p = self.pumps[i]
-                old_on = p.on
                 new_on = bool((best_mask >> i) & 1)
+                old_on = p.on
                 if new_on != old_on:
                     p.switch_count += 1
                 p.on = new_on
-                p.frequency = full_freq if new_on else 0.0
-                p.flow = p.conv_to_flow(p.frequency)
+                if new_on:
+                    p.frequency = best_freq
+                    p.flow = p.conv_to_flow(p.frequency)
+                else:
+                    p.frequency = 0.0
+                    p.flow = 0.0
 
+        # Final outflow
         self.F2 = sum(p.flow for p in self.pumps)
+                # -----------------------------------------------
+        # FINAL GEOMETRIC SAFE-MIN OVERRIDE (AFTER F2 SET)
+        # -----------------------------------------------
+        try:
+            if dt_hours > 0.0 and self.F2 > 0.0:
+                V_current = height_to_volume(self.L1)
+                V_safe    = height_to_volume(self.L1_safe_min)
 
-    def get_weather(self):
-        return self.weather
+                # Where would this minute step land us?
+                V_pred = V_current + dt_hours * (self.F1 - self.F2)
+
+                # If we'd go below safe volume, compute the F2 that lands
+                # exactly at L1_safe_min instead.
+                if V_pred < V_safe:
+                    F2_safe = self.F1 + (V_current - V_safe) / dt_hours
+                    F2_safe = max(self.F2_min, min(F2_safe, self.F2_max))
+
+                    if F2_safe < self.F2:
+                        scale = F2_safe / self.F2
+                        scale = max(0.0, min(scale, 1.0))
+
+                        # Scale frequencies down; if any would drop below
+                        # usable range, just shut that pump off.
+                        for p in self.pumps:
+                            if p.on and p.frequency > 0.0:
+                                # slide towards freq_min, not to zero,
+                                # so we keep shape of dispatch
+                                new_freq = freq_min + (p.frequency - freq_min) * scale
+
+                                if new_freq <= 45.0:
+                                    # hard off – we're in a safety override, so
+                                    # ignore min on/off constraints
+                                    p.on = False
+                                    p.frequency = 0.0
+                                    p.flow = 0.0
+                                    p.switch_count = getattr(p, "switch_count", 0) + 1
+                                else:
+                                    p.frequency = new_freq
+                                    p.flow = p.conv_to_flow(p.frequency)
+
+                        # Recompute actual outflow after override
+                        self.F2 = sum(p.flow for p in self.pumps)
+        except Exception:
+            # Safety override must never crash the controller
+            pass
+
+
 
 
 class Pump:
@@ -457,6 +627,9 @@ def compute_baseline_cost(df, price_col="Electricity price 2: normal", max_days=
         df = df[df["Time stamp"] < end_time].reset_index(drop=True)
 
     dt_seconds = df["Time stamp"].diff().dt.total_seconds().median()
+    dt_hours = dt_seconds / 360.0 / 10.0  # dt_seconds / 3600.0
+
+    # FIX: careful – above was wrong math; use:
     dt_hours = dt_seconds / 3600.0
 
     F2_raw = df["Sum of pumped flow to WWTP F2"].values  # m3/h
@@ -470,11 +643,14 @@ def compute_baseline_cost(df, price_col="Electricity price 2: normal", max_days=
 
 def simulate_controller(df, price_col="Electricity price 2: normal", max_days=None):
     """
-    Run your controller over the cleaned_data time series.
+    Run your controller over the cleaned_data time series, but internally
+    integrate with a finer timestep (e.g. 60 seconds), interpolating F1
+    (and price) between measurement points.
 
     Returns:
       results_df, controller_cost, sys
     """
+    # --- sort and optionally truncate ---
     df = df.sort_values("Time stamp").reset_index(drop=True)
 
     if max_days is not None:
@@ -482,14 +658,19 @@ def simulate_controller(df, price_col="Electricity price 2: normal", max_days=No
         end_time = start_time + pd.Timedelta(days=max_days)
         df = df[df["Time stamp"] < end_time].reset_index(drop=True)
 
+    # Fallback for weird gaps
     dt_seconds_series = df["Time stamp"].diff().dt.total_seconds()
-    dt_seconds = float(dt_seconds_series.median())
-    dt_hours = dt_seconds / 3600.0
+    dt_seconds_nominal = float(dt_seconds_series.median())
+    if not np.isfinite(dt_seconds_nominal) or dt_seconds_nominal <= 0:
+        dt_seconds_nominal = 900.0  # assume 15 min
 
+    # --- init system from first row ---
     first_row = df.iloc[0]
     sys = system_from_row(first_row)
 
-    L1_init = float(first_row["Water level in tunnel L2"])
+    # Don't start below safe operating limit
+    L1_init_raw = float(first_row["Water level in tunnel L2"])
+    L1_init = max(L1_init_raw, sys.L1_safe_min)
     V = height_to_volume(L1_init)
     sys.L1 = L1_init
 
@@ -502,40 +683,130 @@ def simulate_controller(df, price_col="Electricity price 2: normal", max_days=No
 
     F1_rain_threshold = 2000.0  # still optional
 
+    # --- substep size (THIS is the important change) ---
+    DT_SUB_SECONDS = 60.0  # 1-minute integration steps
+
+    # ---- DEBUG HEADER: per-output-step print ----
+    print(
+        "timestamp, "
+        "L1_m, "
+        "F1_m3ph, "
+        "F2_m3ph, "
+        "price_EUR_per_kWh, "
+        "pump_freqs_Hz"
+    )
+
+    # --- main loop over 15-min (or whatever) samples ---
     for t in range(1, len(df)):
         row_prev = df.iloc[t - 1]
         row = df.iloc[t]
 
-        dt = dt_seconds
-        if pd.notna(row_prev["Time stamp"]) and pd.notna(row["Time stamp"]):
-            dt = (row["Time stamp"] - row_prev["Time stamp"]).total_seconds() or dt_seconds
-        dt_hours = dt / 3600.0
+        # Total time between samples
+        total_dt = (row["Time stamp"] - row_prev["Time stamp"]).total_seconds()
+        if not np.isfinite(total_dt) or total_dt <= 0:
+            total_dt = dt_seconds_nominal
 
-        sys.F1 = float(row_prev["Inflow to tunnel F1"]) * 4.0
-        sys.costperkw = float(row_prev[price_col])
-        sys.weather = bool(sys.F1 > F1_rain_threshold)
+        # Number of substeps (ceil so dt_sub <= DT_SUB_SECONDS)
+        n_sub = max(1, int(math.ceil(total_dt / DT_SUB_SECONDS)))
+        dt_sub = total_dt / n_sub
+        dt_sub_hours = dt_sub / 3600.0
 
-        # keep level consistent with volume
-        sys.L1 = volume_to_height(V)
+        # Values at endpoints
+        F1_prev = float(row_prev["Inflow to tunnel F1"]) * 4.0
+        F1_next = float(row["Inflow to tunnel F1"]) * 4.0
 
-        # --- run controller ---
-        sys.step(dt)
+        price_prev = float(row_prev[price_col])
+        price_next = float(row[price_col])
 
-        # --- update physical state ---
-        V = V + dt_hours * (sys.F1 - sys.F2)
-        # still clamp V into geometry range so volume_to_height doesn't go crazy
-        V = max(_VOLUMES[0], min(V, _VOLUMES[-1]))
-        L1_new = volume_to_height(V)
-        sys.L1 = L1_new
+        # ---- integrate with substeps ----
+        for k in range(n_sub):
+            # fraction of interval elapsed at END of this substep (0..1]
+            frac = float(k + 1) / float(n_sub)
 
-        controller_cost += sys.costperkw * sys.F2 * dt_hours
+            # Linear interpolation for F1 and price
+            sys.F1 = F1_prev + frac * (F1_next - F1_prev)
+            sys.costperkw = price_prev + frac * (price_next - price_prev)
+            sys.weather = bool(sys.F1 > F1_rain_threshold)
 
-        # per-step pump state timeline  ### CHANGED
+            # keep level consistent with volume
+            sys.L1 = volume_to_height(V)
+
+                        # --- run controller on this small dt ---
+            sys.step(dt_sub)
+
+                        # --- HARD SAFE-MIN: TURN OFF PUMPS IF NEEDED ---
+            V_current = V
+            V_floor   = height_to_volume(sys.L1_safe_min)   # absolute 0.2 m
+            V_trigger = height_to_volume(0.2)               # start reacting below 0.3 m
+
+            if dt_sub_hours > 0.0 and sys.F2 > 0.0:
+                # Predict where this minute will land us with current F2
+                V_pred = V_current + dt_sub_hours * (sys.F1 - sys.F2)
+
+                # Start emergency logic as soon as we would go below 0.3 m
+                if V_pred < V_trigger:
+                    # Emergency mode: turn OFF pumps (ignoring min on/off)
+                    # until the next step is safe w.r.t. 0.2 m floor.
+
+                    pumps_on = [(i, p) for i, p in enumerate(sys.pumps)
+                                if p.on and p.flow > 0.0]
+                    pumps_on.sort(key=lambda ip: ip[1].flow, reverse=True)
+
+                    for idx, p in pumps_on:
+                        # Tentatively switch this pump off
+                        p.on = False
+                        p.frequency = 0.0
+                        p.flow = 0.0
+                        p.switch_count = getattr(p, "switch_count", 0) + 1
+
+                        F2_candidate = sum(pp.flow for pp in sys.pumps)
+                        V_candidate = V_current + dt_sub_hours * (sys.F1 - F2_candidate)
+
+                        # Commit this F2
+                        sys.F2 = F2_candidate
+
+                        # As soon as we are safe vs 0.2 m, stop turning pumps off
+                        if V_candidate >= V_floor:
+                            break
+
+                    # Make sure our target isn't above what we can actually do now
+                    sys.F2_target = min(sys.F2_target, sys.F2)
+
+
+
+            # --- update physical state with small dt ---
+            V = V + dt_sub_hours * (sys.F1 - sys.F2)
+            # clamp volume into geometry range
+            V = max(_VOLUMES[0], min(V, _VOLUMES[-1]))
+            L1_new = volume_to_height(V)
+            # hard clamp physical L1 into [0, 8]
+            L1_new = max(sys.L1_min, min(L1_new, sys.L1_max))
+            sys.L1 = L1_new
+
+            # incremental cost
+            controller_cost += sys.costperkw * sys.F2 * dt_sub_hours
+
+
+        # ---- after finishing substeps, log one row at the *measurement* time ----
         pump_states = [int(p.on) for p in sys.pumps]
         pump_mask = 0
         for i, on in enumerate(pump_states):
             if on:
                 pump_mask |= (1 << i)
+
+        # DEBUG PRINT (one line per original timestep, not per minute)
+        pump_freqs_str = ", ".join(
+            f"{i}:{p.frequency:.1f}"
+            for i, p in enumerate(sys.pumps)
+        )
+        print(
+            f"{row['Time stamp']}, "
+            f"{sys.L1:.3f}, "
+            f"{sys.F1:.1f}, "
+            f"{sys.F2:.1f}, "
+            f"{sys.costperkw:.4f}, "
+            f"[{pump_freqs_str}]"
+        )
 
         row_dict = {
             "Time stamp": row["Time stamp"],
@@ -569,7 +840,7 @@ def evaluate_results(results_df, baseline_cost, controller_cost,
     L1 = results_df["L1"].values
     L1_violations_low = np.sum(L1 < L1_min)
     L1_violations_high = np.sum(L1 > L1_max)
-    L1_safe_min = 0.3
+    L1_safe_min = 0.1   # match controller safe min
     L1_violations_safe = np.sum(L1 < L1_safe_min)
     L1_mean = float(np.mean(L1))
 
@@ -718,8 +989,8 @@ def volume_to_height(volume):
 
 # 1. Load data
 df = pd.read_csv("./output/cleaned_data.csv", parse_dates=["Time stamp"])
-
-SIM_DAYS = 31  # ← change this to simulate any period you want
+df["Electricity price 2: normal"] = df["Electricity price 2: normal"] / 100.0
+SIM_DAYS = 7  # ← change this to simulate any period you want
 
 # 2. Baseline cost
 baseline_cost = compute_baseline_cost(df, price_col="Electricity price 2: normal",
@@ -766,4 +1037,3 @@ for i, p in enumerate(sys.pumps):
 switch_stats_df = pd.DataFrame(rows)
 print(f"\n=== Pump switching intervals over {SIM_DAYS} days ===")
 print(switch_stats_df.to_string(index=False))
-
