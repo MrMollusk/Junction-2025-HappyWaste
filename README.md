@@ -28,7 +28,6 @@ This repo is suitable for a hackathon team to:
 **Time scaling:**
 
 - 1 real second = 10 simulated minutes.
-- The 7-day simulation loops forever.
 
 ### 1.2 Who This Is For
 
